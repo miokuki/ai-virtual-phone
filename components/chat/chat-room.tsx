@@ -98,10 +98,19 @@ function isCallSysMsg(msg: ChatMessage): boolean {
 }
 /** Returns the effective UI role: call messages render as "system" regardless of stored role */
 const ACTION_MEDIA_TYPES = new Set(["poke", "accept_red_packet", "decline_red_packet", "accept_transfer", "decline_transfer", "accept_payment_request", "decline_payment_request", "group_admin_notice"]);
+// The display regex turns standalone *action* messages into this span. Recognize
+// both forms so panel placement is the same before and after display projection.
+function isStandaloneActionNarration(part: { content?: string; mediaType?: ChatMessage["mediaType"] }): boolean {
+    if (part.mediaType) return false;
+    const content = (part.content || "").trim();
+    return /^\*[ \t]*[^*\r\n]{1,90}?[ \t]*\*$/.test(content)
+        || /^<span class="float-action-narration">[^<>]*<\/span>$/.test(content);
+}
 // 拍一拍/群管理通知/通话留痕渲染成灰色系统小字，没有 💭 面板入口——
 // 状态栏/内心独白/状态值挂上去会被显示层吞掉，挂载时必须跳过它们
 function canCarryFoldedPanel(part: { content?: string; mediaType?: ChatMessage["mediaType"] }): boolean {
     if (part.mediaType === "poke" || part.mediaType === "group_admin_notice") return false;
+    if (isStandaloneActionNarration(part)) return false;
     return !CALL_SYS_RE.test(part.content || "");
 }
 function uiRole(msg: ChatMessage): string {
@@ -5168,8 +5177,65 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 });
             }
         }
+        // Older stored batches may still have their panel on an opening narration.
+        // Re-anchor it for display without rewriting the saved messages.
+        for (let index = 0; index < projected.length; index += 1) {
+            const narration = projected[index];
+            if (narration.role !== "assistant" || !narration.responseBatchId || !isStandaloneActionNarration(narration)) continue;
+            if (!narration.statusPanel && !narration.innerMonologue && !narration.reasoningText
+                && !narration.stateValues?.length && !narration.freshStateValues?.length) continue;
+
+            // Only opening narration is special; narration later in the same
+            // batch must not move an existing panel past an ordinary message.
+            let hasEarlierAnchor = false;
+            for (let prevIndex = index - 1; prevIndex >= 0; prevIndex -= 1) {
+                const candidate = projected[prevIndex];
+                if (candidate.role !== "assistant"
+                    || candidate.responseBatchId !== narration.responseBatchId
+                    || candidate.responseRoundId !== narration.responseRoundId
+                    || (session.isGroup && candidate.senderCharacterId !== narration.senderCharacterId)) break;
+                if (canCarryFoldedPanel(candidate)) {
+                    hasEarlierAnchor = true;
+                    break;
+                }
+            }
+            if (hasEarlierAnchor) continue;
+
+            let anchorIndex = -1;
+            for (let nextIndex = index + 1; nextIndex < projected.length; nextIndex += 1) {
+                const candidate = projected[nextIndex];
+                if (candidate.role !== "assistant"
+                    || candidate.responseBatchId !== narration.responseBatchId
+                    || candidate.responseRoundId !== narration.responseRoundId
+                    || (session.isGroup && candidate.senderCharacterId !== narration.senderCharacterId)) break;
+                if (canCarryFoldedPanel(candidate)) {
+                    anchorIndex = nextIndex;
+                    break;
+                }
+            }
+            if (anchorIndex < 0) continue;
+            const anchor = projected[anchorIndex];
+            projected[anchorIndex] = {
+                ...anchor,
+                statusPanel: anchor.statusPanel || narration.statusPanel,
+                statusRegionMode: anchor.statusRegionMode || narration.statusRegionMode,
+                innerMonologue: anchor.innerMonologue || narration.innerMonologue,
+                reasoningText: anchor.reasoningText || narration.reasoningText,
+                stateValues: anchor.stateValues || narration.stateValues,
+                freshStateValues: anchor.freshStateValues || narration.freshStateValues,
+            };
+            projected[index] = {
+                ...narration,
+                statusPanel: undefined,
+                statusRegionMode: undefined,
+                innerMonologue: undefined,
+                reasoningText: undefined,
+                stateValues: undefined,
+                freshStateValues: undefined,
+            };
+        }
         return projected;
-    }, [dedupedMessages, normalizeDisplayParts, renderDisplayText]);
+    }, [dedupedMessages, normalizeDisplayParts, renderDisplayText, session.isGroup]);
 
     // Build a map: startMsgId → { startIdx, endIdx, duration }
     // and a set of all message indices that belong to a voice call group
@@ -5792,8 +5858,29 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                         break;
                     }
                     const showTime = shouldShowTimestamp(msg.createdAt, prevVisibleMsg?.createdAt ?? null);
+                    // Narration can lead a response batch without becoming its avatar anchor.
+                    // Only the first ordinary message after *all* leading narration needs an
+                    // avatar; a later narration between ordinary messages does not reset it.
+                    let firstOrdinaryAfterOpeningNarration = false;
+                    if (msg.role === "assistant" && msg.responseBatchId && !isStandaloneActionNarration(msg)) {
+                        for (let prevIdx = idx - 1; prevIdx >= 0; prevIdx -= 1) {
+                            if (voiceCallGroups.memberSet.has(prevIdx)) continue;
+                            const candidate = projectedMessages[prevIdx];
+                            if (candidate.role !== "assistant"
+                                || candidate.responseBatchId !== msg.responseBatchId
+                                || candidate.responseRoundId !== msg.responseRoundId
+                                || (session.isGroup && candidate.senderCharacterId !== msg.senderCharacterId)) break;
+                            if (isHiddenChatFlowMessage(candidate, getMessageDisplayContent(candidate))) continue;
+                            if (!isStandaloneActionNarration(candidate)) {
+                                firstOrdinaryAfterOpeningNarration = false;
+                                break;
+                            }
+                            firstOrdinaryAfterOpeningNarration = true;
+                        }
+                    }
                     const isConsecutive = prevVisibleMsg && !showTime && uiRole(prevVisibleMsg) === uiRole(msg) && uiRole(msg) !== "system"
-                        && (!session.isGroup || prevVisibleMsg.senderCharacterId === msg.senderCharacterId);
+                        && (!session.isGroup || prevVisibleMsg.senderCharacterId === msg.senderCharacterId)
+                        && !firstOrdinaryAfterOpeningNarration;
                     // Hide bubbles with no visible content (empty text, stripped music tags, etc.)
                     const visibleContent = getChatFlowVisibleContent(renderMsg, bubbleDisplayContent);
                     const isVisualMedia = isChatVisualMedia(renderMsg);
